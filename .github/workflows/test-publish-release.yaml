@@ -4,6 +4,12 @@ on:
   - push
   - pull_request
 
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 
 env:
   PROTOBUF_VERSION: "33.0"
@@ -13,6 +19,8 @@ jobs:
     name: Ensure Protos Are Up To Date
     # Go no further if this job fails.
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       - uses: actions/checkout@v4
@@ -39,6 +47,8 @@ jobs:
   rust-test:
     name: Rust Tests
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     needs: ensure-protos-up-to-date
     steps:
       - uses: actions/checkout@v4
@@ -54,6 +64,8 @@ jobs:
 
   rust-formatting:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     needs: ensure-protos-up-to-date
 
     steps:
@@ -71,6 +83,8 @@ jobs:
   rust-lint:
     name: Lint for warnings
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     needs: ensure-protos-up-to-date
     steps:
       - uses: actions/checkout@v4
@@ -87,6 +101,8 @@ jobs:
     name: Python Tests
     needs: ensure-protos-up-to-date
     runs-on: ${{ matrix.platform }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -113,6 +129,8 @@ jobs:
     needs: ensure-protos-up-to-date
     name: Python Black
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -167,6 +185,8 @@ jobs:
 
   publish-rust:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     if: contains(github.ref, 'refs/tags/v')
     needs: create-github-release
     name: Publish Rust crate
@@ -182,7 +202,7 @@ jobs:
     name: Build Python distribution
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
     needs:
       - create-github-release
     steps:
@@ -210,7 +230,7 @@ jobs:
 
   publish-python:
     name: >-
-      Publish Python 🐍 distribution 📦 to PyPI
+      Publish Python distribution to OSS Exit Gate
     if: startsWith(github.ref, 'refs/tags/')  # only publish to PyPI on tag pushes
     needs:
       - package-python
@@ -219,15 +239,115 @@ jobs:
       name: pypi
       url: https://pypi.org/p/gfmetadata/
     permissions:
-      id-token: write  # IMPORTANT: mandatory for trusted publishing
+      contents: read
+      id-token: write  # Required for Workload Identity Federation with OSS Exit Gate
     steps:
-      - name: Download all the dists
-        uses: actions/download-artifact@v4
+      - name: Download built Python distributions
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: python-package-distributions
           path: dist/
-      - name: Publish distribution 📦 to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
-          # repository-url: https://test.pypi.org/legacy/ # for testing purposes
-          verify-metadata: false # twine previously didn't verify metadata when uploading
+          python-version: '3.12'
+
+      - name: Install upload tool before authentication
+        run: |
+          set -euo pipefail
+          python3 -m venv "${RUNNER_TEMP}/eg-venv"
+          "${RUNNER_TEMP}/eg-venv/bin/pip" install --no-cache-dir --quiet twine==6.1.0
+
+      - name: Extract package metadata
+        id: pkg_meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "${GITHUB_OUTPUT}"
+          import email, glob, os, sys, tarfile, zipfile
+          names, versions = set(), set()
+          files = sorted(glob.glob("dist/*.whl") + glob.glob("dist/*.tar.gz"))
+          if not files:
+              sys.exit("ERROR: no wheel or sdist found under dist/")
+          for path in files:
+              if path.endswith(".whl"):
+                  with zipfile.ZipFile(path) as zf:
+                      meta_files = [n for n in zf.namelist() if n.endswith(".dist-info/METADATA")]
+                      msg = email.message_from_bytes(zf.read(meta_files[0]))
+              else:
+                  with tarfile.open(path, "r:gz") as tf:
+                      pkg_infos = [m for m in tf.getmembers() if m.name.count("/") == 1 and m.name.endswith("/PKG-INFO")]
+                      msg = email.message_from_bytes(tf.extractfile(pkg_infos[0]).read())
+              names.add(msg["Name"].strip())
+              versions.add(msg["Version"].strip())
+          if len(names) != 1 or len(versions) != 1:
+              sys.exit(f"ERROR: expected single package/version, got names={names} versions={versions}")
+          print(f"package_name={next(iter(names))}")
+          print(f"package_version={next(iter(versions))}")
+          PY
+
+      - name: Authenticate to OSS Exit Gate via WIF
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: "projects/305452601764/locations/global/workloadIdentityPools/builders/providers/github"
+
+      - name: Set up gcloud CLI
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Upload distributions to Artifact Registry and trigger release
+        shell: bash
+        env:
+          PACKAGE_NAME: ${{ steps.pkg_meta.outputs.package_name }}
+          PACKAGE_VERSION: ${{ steps.pkg_meta.outputs.package_version }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          AR_PROJECT: oss-exit-gate-prod
+          AR_LOCATION: us
+          AR_REPO: gf-metadata--pypi
+          MANIFEST_BUCKET: gs://oss-exit-gate-prod-projects-bucket/gf-metadata/pypi/manifests
+        run: |
+          set -euo pipefail
+          umask 077
+          manifest_path="${RUNNER_TEMP}/manifest-${RUN_ID}-${RUN_ATTEMPT}.json"
+          trap 'rm -f "${manifest_path}"' EXIT
+
+          # Remove only the colliding package version (if a prior run failed/retried).
+          gcloud artifacts versions delete "${PACKAGE_VERSION}" \
+            --project="${AR_PROJECT}" \
+            --location="${AR_LOCATION}" \
+            --repository="${AR_REPO}" \
+            --package="${PACKAGE_NAME}" \
+            --quiet || true
+
+          TWINE_PASSWORD="$(gcloud auth print-access-token)"
+          if [ -z "${TWINE_PASSWORD}" ]; then
+            echo "ERROR: failed to obtain access token from gcloud" >&2
+            exit 1
+          fi
+          echo "::add-mask::${TWINE_PASSWORD}"
+          export TWINE_USERNAME="oauth2accesstoken"
+          export TWINE_PASSWORD
+
+          "${RUNNER_TEMP}/eg-venv/bin/twine" upload \
+            --non-interactive \
+            --repository-url "https://us-python.pkg.dev/${AR_PROJECT}/${AR_REPO}/" \
+            dist/*
+
+          jq -n \
+            --arg name "${PACKAGE_NAME}" \
+            --arg ver "${PACKAGE_VERSION}" \
+            '{
+              publish_all: false,
+              publishing_groups: [
+                {
+                  packages: [
+                    { name: $name, version: $ver }
+                  ]
+                }
+              ]
+            }' > "${manifest_path}"
+
+          gcloud storage cp --if-generation-match=0 \
+            "${manifest_path}" \
+            "${MANIFEST_BUCKET}/manifest-${RUN_ID}-${RUN_ATTEMPT}.json"
